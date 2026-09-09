@@ -1,56 +1,65 @@
 /**
- * Full ingestion pipeline:
+ * Full ingestion pipeline — scoped per user.
  *   parse PDF → chunk → extract facts → normalize → store → compare
+ *
+ * Every record carries userId so each user has their own isolated
+ * knowledge base. Cross-document comparison only runs within the
+ * same user's facts.
  */
 
-import { query, queryOne } from '@/lib/db';
-import { parsePdf, chunkPage } from './parse';
-import { extractFactsFromChunk } from '@/lib/llm/extract';
-import { compareFacts } from '@/lib/llm/compare';
+import { Types } from "mongoose";
+import { connectDB } from "@/lib/db/mongoose";
+import { DocumentModel, ChunkModel, FactModel, RelationshipModel, IFact } from "@/lib/db/models";
+import { parsePdf, chunkPage } from "./parse";
+import { extractFactsFromChunk } from "@/lib/llm/extract";
+import { compareFacts } from "@/lib/llm/compare";
 import {
   normalizeEntityName,
   normalizeNumericValue,
   normalizeAttribute,
   resolveEntityCanonical,
-} from './normalize';
-import { Fact } from '@/types';
-import crypto from 'crypto';
+} from "./normalize";
+import { Fact } from "@/types";
+import crypto from "crypto";
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function sha256(buf: Buffer): string {
-  return crypto.createHash('sha256').update(buf).digest('hex');
+  return crypto.createHash("sha256").update(buf).digest("hex");
 }
 
-async function updateDocumentStatus(
-  docId: string,
-  status: string,
-  extra: Record<string, unknown> = {}
-) {
-  if (extra.page_count !== undefined && extra.error_message !== undefined) {
-    await query(
-      'UPDATE documents SET status = $2, page_count = $3, error_message = $4, updated_at = NOW() WHERE id = $1',
-      [docId, status, extra.page_count, extra.error_message]
-    );
-  } else if (extra.page_count !== undefined) {
-    await query(
-      'UPDATE documents SET status = $2, page_count = $3, updated_at = NOW() WHERE id = $1',
-      [docId, status, extra.page_count]
-    );
-  } else if (extra.error_message !== undefined) {
-    await query(
-      'UPDATE documents SET status = $2, error_message = $3, updated_at = NOW() WHERE id = $1',
-      [docId, status, extra.error_message]
-    );
-  } else {
-    await query(
-      'UPDATE documents SET status = $2, updated_at = NOW() WHERE id = $1',
-      [docId, status]
-    );
-  }
+function docToFact(doc: IFact & { docName?: string }): Fact {
+  return {
+    id: doc._id.toString(),
+    doc_id: doc.docId.toString(),
+    entity: doc.entity,
+    entity_canonical: doc.entityCanonical,
+    attribute: doc.attribute,
+    value: doc.value,
+    value_normalized: doc.valueNormalized ?? null,
+    unit: doc.unit,
+    time_scope: doc.timeScope,
+    qualifiers: doc.qualifiers,
+    quote: doc.quote,
+    page: doc.page,
+    char_start: doc.charStart,
+    char_end: doc.charEnd,
+    confidence: doc.confidence,
+    created_at: doc.createdAt.toISOString(),
+    source: doc.docName
+      ? {
+          doc_id: doc.docId.toString(),
+          doc_name: doc.docName,
+          page: doc.page,
+          char_start: doc.charStart,
+          char_end: doc.charEnd,
+          quote: doc.quote,
+        }
+      : undefined,
+  };
 }
 
-// ─── Main Pipeline ───────────────────────────────────────────────────────────
+// ── Main pipeline ─────────────────────────────────────────────────────────────
 
 export interface IngestResult {
   docId: string;
@@ -61,77 +70,70 @@ export interface IngestResult {
 
 export async function ingestDocument(
   buffer: Buffer,
-  originalName: string
+  originalName: string,
+  userId: Types.ObjectId
 ): Promise<IngestResult> {
+  await connectDB();
+
   const hash = sha256(buffer);
 
-  // ── Dedup check ────────────────────────────────────────────────────────────
-  const existing = await queryOne<{ id: string }>(
-    'SELECT id FROM documents WHERE content_hash = $1',
-    [hash]
-  );
+  // ── Dedup: same user, same file ───────────────────────────────────────────
+  const existing = await DocumentModel.findOne({ userId, contentHash: hash })
+    .select("_id")
+    .lean();
   if (existing) {
-    console.log(`Document already ingested: ${originalName} (hash match ${existing.id})`);
-    return { docId: existing.id, factsExtracted: 0, relationshipsFound: 0, skippedDuplicate: true };
+    console.log(`[dedup] ${userId} already uploaded: ${originalName}`);
+    return { docId: existing._id.toString(), factsExtracted: 0, relationshipsFound: 0, skippedDuplicate: true };
   }
 
-  // ── Create document record ─────────────────────────────────────────────────
-  const filename = `${hash.slice(0, 8)}_${Date.now()}.pdf`;
-  const docRow = await queryOne<{ id: string }>(
-    `INSERT INTO documents (filename, original_name, file_size, content_hash, status)
-     VALUES ($1, $2, $3, $4, 'processing')
-     RETURNING id`,
-    [filename, originalName, buffer.length, hash]
-  );
-  if (!docRow) throw new Error('Failed to create document record');
-  const docId = docRow.id;
+  // ── Create document record ────────────────────────────────────────────────
+  const docRecord = await DocumentModel.create({
+    userId,
+    filename: `${hash.slice(0, 8)}_${Date.now()}.pdf`,
+    originalName,
+    fileSize: buffer.length,
+    contentHash: hash,
+    status: "processing",
+  });
+  const docId = docRecord._id;
 
   try {
-    // ── Parse PDF ─────────────────────────────────────────────────────────────
-    console.log(`[${docId}] Parsing PDF: ${originalName}`);
+    // ── Parse PDF ─────────────────────────────────────────────────────────
+    console.log(`[${docId}] Parsing: ${originalName}`);
     const { pages, totalPages } = await parsePdf(buffer);
-    await updateDocumentStatus(docId, 'processing', { page_count: totalPages });
+    await DocumentModel.updateOne({ _id: docId }, { pageCount: totalPages });
 
-    // ── Chunk pages ───────────────────────────────────────────────────────────
-    const allChunks = pages.flatMap((pageText, i) =>
-      chunkPage(pageText, docId, i + 1)
+    // ── Chunk ──────────────────────────────────────────────────────────────
+    const allChunks = pages.flatMap((text, i) =>
+      chunkPage(text, docId.toString(), i + 1)
     );
 
-    // ── Batch insert chunks (50 at a time) ────────────────────────────────────
-    for (let i = 0; i < allChunks.length; i += 50) {
-      const batch = allChunks.slice(i, i + 50);
-      const vals = batch
-        .map(
-          (_, j) =>
-            `($${j * 6 + 1}, $${j * 6 + 2}, $${j * 6 + 3}, $${j * 6 + 4}, $${j * 6 + 5}, $${j * 6 + 6})`
-        )
-        .join(', ');
-      const params = batch.flatMap((c) => [
-        c.doc_id,
-        c.page,
-        c.chunk_index,
-        c.text,
-        c.char_start,
-        c.char_end,
-      ]);
-      await query(
-        `INSERT INTO chunks (doc_id, page, chunk_index, text, char_start, char_end) VALUES ${vals}`,
-        params
+    // ── Batch-insert chunks ────────────────────────────────────────────────
+    for (let i = 0; i < allChunks.length; i += 100) {
+      const batch = allChunks.slice(i, i + 100);
+      await ChunkModel.insertMany(
+        batch.map((c) => ({
+          docId,
+          userId,
+          page: c.page,
+          chunkIndex: c.chunk_index,
+          text: c.text,
+          charStart: c.char_start,
+          charEnd: c.char_end,
+        })),
+        { ordered: false }
       );
     }
 
-    // ── Get existing entity canonicals for within-doc resolution ──────────────
-    const existingEntities = await query<{ entity_canonical: string }>(
-      'SELECT DISTINCT entity_canonical FROM facts'
-    );
-    const knownCanonicals = existingEntities.map((r) => r.entity_canonical);
+    // ── Known canonicals scoped to this user ──────────────────────────────
+    const knownDocs = await FactModel.distinct("entityCanonical", { userId });
+    const knownCanonicals: string[] = [...knownDocs];
 
-    // ── Extract facts from each chunk ─────────────────────────────────────────
-    console.log(`[${docId}] Extracting facts from ${allChunks.length} chunks...`);
-    const insertedFactIds: string[] = [];
-
-    // Process in parallel batches (concurrency=3 to respect rate limits)
+    // ── Extract facts (concurrency = 3) ───────────────────────────────────
+    console.log(`[${docId}] Extracting from ${allChunks.length} chunks…`);
+    const insertedFactIds: Types.ObjectId[] = [];
     const CONCURRENCY = 3;
+
     for (let i = 0; i < allChunks.length; i += CONCURRENCY) {
       const batch = allChunks.slice(i, i + CONCURRENCY);
       const results = await Promise.all(
@@ -142,184 +144,112 @@ export async function ingestDocument(
 
       for (let j = 0; j < batch.length; j++) {
         const chunk = batch[j];
-        const extracted = results[j];
-
-        for (const ef of extracted) {
-          const canonicalEntity = resolveEntityCanonical(ef.entity, knownCanonicals);
-          const normalizedEntity = normalizeEntityName(ef.entity);
-          const normalizedAttr = normalizeAttribute(ef.attribute);
-          const valueNormalized = normalizeNumericValue(ef.value, ef.unit);
-
-          // Track new canonical for within-document resolution
-          if (!knownCanonicals.includes(canonicalEntity)) {
-            knownCanonicals.push(canonicalEntity);
+        for (const ef of results[j]) {
+          const entityCanonical = resolveEntityCanonical(ef.entity, knownCanonicals);
+          if (!knownCanonicals.includes(entityCanonical)) {
+            knownCanonicals.push(entityCanonical);
           }
 
-          // Locate quote within chunk to compute absolute char offsets
           const quoteIdx = chunk.text.indexOf(ef.quote);
-          const charStart =
-            quoteIdx >= 0 ? chunk.char_start + quoteIdx : chunk.char_start;
-          const charEnd =
-            quoteIdx >= 0 ? charStart + ef.quote.length : chunk.char_end;
+          const charStart = quoteIdx >= 0 ? chunk.char_start + quoteIdx : chunk.char_start;
+          const charEnd   = quoteIdx >= 0 ? charStart + ef.quote.length  : chunk.char_end;
 
-          const factRow = await queryOne<{ id: string }>(
-            `INSERT INTO facts
-              (doc_id, entity, entity_canonical, attribute, value, value_normalized,
-               unit, time_scope, qualifiers, quote, page, char_start, char_end, confidence)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-             RETURNING id`,
-            [
-              docId,
-              normalizedEntity,
-              canonicalEntity,
-              normalizedAttr,
-              ef.value,
-              valueNormalized,
-              ef.unit ?? null,
-              ef.time_scope ?? null,
-              JSON.stringify(ef.qualifiers),
-              ef.quote,
-              chunk.page,
-              charStart,
-              charEnd,
-              ef.confidence,
-            ]
-          );
+          const fact = await FactModel.create({
+            docId,
+            userId,
+            entity:          normalizeEntityName(ef.entity),
+            entityCanonical,
+            attribute:       normalizeAttribute(ef.attribute),
+            value:           ef.value,
+            valueNormalized: normalizeNumericValue(ef.value, ef.unit) ?? undefined,
+            unit:      ef.unit,
+            timeScope: ef.time_scope,
+            qualifiers: ef.qualifiers,
+            quote:      ef.quote,
+            page:       chunk.page,
+            charStart,
+            charEnd,
+            confidence: ef.confidence,
+          });
 
-          if (factRow) {
-            insertedFactIds.push(factRow.id);
-          }
+          insertedFactIds.push(fact._id);
         }
       }
     }
 
     console.log(`[${docId}] Extracted ${insertedFactIds.length} facts`);
 
-    // ── Comparison engine ─────────────────────────────────────────────────────
+    // ── Comparison engine — only within this user's knowledge base ─────────
     let relationshipsFound = 0;
 
     if (insertedFactIds.length > 0) {
-      console.log(`[${docId}] Running comparison engine...`);
+      console.log(`[${docId}] Comparing against user's existing facts…`);
 
-      // Fetch the newly inserted facts with their document name
-      const newFacts = await query<Fact & { doc_name: string }>(
-        `SELECT f.*, d.original_name as doc_name
-         FROM facts f
-         JOIN documents d ON d.id = f.doc_id
-         WHERE f.id = ANY($1)`,
-        [insertedFactIds]
-      );
+      const newFacts = await FactModel.find({ _id: { $in: insertedFactIds } }).lean<IFact[]>();
 
-      for (const newFact of newFacts) {
-        // Find candidates: same entity + attribute from OTHER documents
-        const candidates = await query<Fact & { doc_name: string }>(
-          `SELECT f.*, d.original_name as doc_name
-           FROM facts f
-           JOIN documents d ON d.id = f.doc_id
-           WHERE f.doc_id != $1
-             AND f.entity_canonical = $2
-             AND f.attribute = $3
-             AND NOT (f.id = ANY($4))
-           LIMIT 5`,
-          [docId, newFact.entity_canonical, newFact.attribute, insertedFactIds]
-        );
+      for (const nf of newFacts) {
+        // Exact: same user, same entity+attribute, different document
+        const exactCandidates = await FactModel.find({
+          userId,
+          docId: { $ne: docId },
+          entityCanonical: nf.entityCanonical,
+          attribute: nf.attribute,
+          _id: { $nin: insertedFactIds },
+        }).limit(5).lean<IFact[]>();
 
-        // Also try broader attribute-only match for different entity spellings
-        const broadCandidates = await query<Fact & { doc_name: string }>(
-          `SELECT f.*, d.original_name as doc_name
-           FROM facts f
-           JOIN documents d ON d.id = f.doc_id
-           WHERE f.doc_id != $1
-             AND f.attribute = $2
-             AND f.entity_canonical != $3
-             AND NOT (f.id = ANY($4))
-           LIMIT 3`,
-          [docId, newFact.attribute, newFact.entity_canonical, insertedFactIds]
-        ).catch(() => [] as Array<Fact & { doc_name: string }>);
+        // Broad: same user, same attribute, different entity spelling
+        const broadCandidates = await FactModel.find({
+          userId,
+          docId: { $ne: docId },
+          attribute: nf.attribute,
+          entityCanonical: { $ne: nf.entityCanonical },
+          _id: { $nin: [...insertedFactIds, ...exactCandidates.map((c) => c._id)] },
+        }).limit(3).lean<IFact[]>();
 
-        const allCandidates = [
-          ...candidates,
-          ...broadCandidates.filter((c) => !candidates.some((x) => x.id === c.id)),
-        ];
+        for (const candidate of [...exactCandidates, ...broadCandidates]) {
+          const [idA, idB] =
+            nf._id.toString() < candidate._id.toString()
+              ? [nf._id, candidate._id]
+              : [candidate._id, nf._id];
 
-        for (const candidate of allCandidates) {
-          // Skip if relationship already recorded
-          const alreadyExists = await queryOne(
-            `SELECT id FROM relationships
-             WHERE (fact_id_a = $1 AND fact_id_b = $2)
-                OR (fact_id_a = $2 AND fact_id_b = $1)`,
-            [newFact.id, candidate.id]
-          );
-          if (alreadyExists) continue;
+          const exists = await RelationshipModel.exists({ userId, factIdA: idA, factIdB: idB });
+          if (exists) continue;
 
-          // Attach source info for the LLM prompt
-          const factAWithSource: Fact = {
-            ...newFact,
-            source: {
-              doc_id: newFact.doc_id,
-              doc_name: newFact.doc_name,
-              page: newFact.page,
-              char_start: newFact.char_start,
-              char_end: newFact.char_end,
-              quote: newFact.quote,
-            },
-          };
-          const factBWithSource: Fact = {
-            ...candidate,
-            source: {
-              doc_id: candidate.doc_id,
-              doc_name: candidate.doc_name,
-              page: candidate.page,
-              char_start: candidate.char_start,
-              char_end: candidate.char_end,
-              quote: candidate.quote,
-            },
-          };
+          // Fetch doc names for the comparison prompt
+          const [docA, docB] = await Promise.all([
+            DocumentModel.findById(nf.docId).select("originalName").lean(),
+            DocumentModel.findById(candidate.docId).select("originalName").lean(),
+          ]);
 
-          const result = await compareFacts(factAWithSource, factBWithSource);
+          const factA = docToFact({ ...nf, docName: docA?.originalName ?? originalName } as IFact & { docName: string });
+          const factB = docToFact({ ...candidate, docName: docB?.originalName ?? "" } as IFact & { docName: string });
 
-          if (result.relation !== 'unrelated') {
-            // Ensure stable ordering for the UNIQUE constraint
-            const [idA, idB] =
-              newFact.id < candidate.id
-                ? [newFact.id, candidate.id]
-                : [candidate.id, newFact.id];
+          const result = await compareFacts(factA, factB);
 
-            await query(
-              `INSERT INTO relationships
-                (fact_id_a, fact_id_b, relation, explanation, confidence, reconciliation_context)
-               VALUES ($1, $2, $3, $4, $5, $6)
-               ON CONFLICT (fact_id_a, fact_id_b) DO NOTHING`,
-              [
-                idA,
-                idB,
-                result.relation,
-                result.explanation,
-                result.confidence,
-                result.reconciliation_context ?? null,
-              ]
-            );
+          if (result.relation !== "unrelated") {
+            await RelationshipModel.create({
+              userId,
+              factIdA: idA,
+              factIdB: idB,
+              relation: result.relation,
+              explanation: result.explanation,
+              confidence: result.confidence,
+              reconciliationContext: result.reconciliation_context,
+            }).catch(() => { /* duplicate race — ignore */ });
             relationshipsFound++;
           }
         }
       }
     }
 
-    await updateDocumentStatus(docId, 'completed');
-    console.log(
-      `[${docId}] Done. Facts: ${insertedFactIds.length}, Relationships: ${relationshipsFound}`
-    );
+    await DocumentModel.updateOne({ _id: docId }, { status: "completed" });
+    console.log(`[${docId}] Done — facts: ${insertedFactIds.length}, rels: ${relationshipsFound}`);
 
-    return {
-      docId,
-      factsExtracted: insertedFactIds.length,
-      relationshipsFound,
-      skippedDuplicate: false,
-    };
+    return { docId: docId.toString(), factsExtracted: insertedFactIds.length, relationshipsFound, skippedDuplicate: false };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`[${docId}] Ingestion failed:`, message);
-    await updateDocumentStatus(docId, 'failed', { error_message: message });
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[${docId}] Failed:`, msg);
+    await DocumentModel.updateOne({ _id: docId }, { status: "failed", errorMessage: msg });
     throw err;
   }
 }

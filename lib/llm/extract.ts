@@ -1,7 +1,8 @@
-import { getOpenAI } from './client';
-import { ExtractedFact } from '@/types';
+import { getGemini } from "./client";
+import { ExtractedFact } from "@/types";
 
-const EXTRACTION_SYSTEM_PROMPT = `You are a precise fact-extraction engine. Given a text chunk from a document, extract all meaningful, verifiable facts as structured JSON.
+const EXTRACTION_PROMPT = (chunk: string, docName: string, page: number) => `
+You are a precise fact-extraction engine. Given a text chunk from a document, extract all meaningful, verifiable facts as structured JSON.
 
 A "fact" is any claim that:
 - States a specific value, figure, name, date, location, status, or relationship
@@ -18,9 +19,6 @@ Rules:
 7. For time-scoped facts, capture the scope (FY2023, Q1 2024, as of March 2023, etc.)
 8. Confidence: 0.9 = clearly stated, 0.7 = implied, 0.5 = ambiguous
 
-Output ONLY a JSON array of fact objects. No prose, no markdown, no explanation.`;
-
-const EXTRACTION_USER_TEMPLATE = (chunk: string, docName: string, page: number) => `
 Document: ${docName}
 Page: ${page}
 Chunk text:
@@ -28,76 +26,82 @@ Chunk text:
 ${chunk}
 ---
 
-Extract all facts from this chunk. Return a JSON array:
-[
-  {
-    "entity": "full entity name",
-    "attribute": "attribute name",
-    "value": "raw value string",
-    "unit": "unit or null",
-    "time_scope": "time scope or null",
-    "qualifiers": ["qualifier1", "qualifier2"],
-    "quote": "exact verbatim substring from the chunk",
-    "confidence": 0.9
-  }
-]
+Return ONLY a valid JSON object in this exact format (no markdown, no prose):
+{
+  "facts": [
+    {
+      "entity": "full entity name",
+      "attribute": "attribute name",
+      "value": "raw value string",
+      "unit": "unit or null",
+      "time_scope": "time scope or null",
+      "qualifiers": ["qualifier1"],
+      "quote": "exact verbatim substring from the chunk",
+      "confidence": 0.9
+    }
+  ]
+}
 
-If no facts are found, return [].`;
+If no facts are found, return { "facts": [] }`.trim();
 
 export async function extractFactsFromChunk(
   chunkText: string,
   docName: string,
   page: number
 ): Promise<ExtractedFact[]> {
-  const openai = getOpenAI();
+  const gemini = getGemini();
 
   try {
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: EXTRACTION_SYSTEM_PROMPT },
-        { role: 'user', content: EXTRACTION_USER_TEMPLATE(chunkText, docName, page) },
-      ],
-      temperature: 0.1,
-      max_tokens: 2000,
-      response_format: { type: 'json_object' },
+    const model = gemini.getGenerativeModel({
+      model: "gemini-1.5-flash",
+      generationConfig: {
+        temperature: 0.1,
+        maxOutputTokens: 2048,
+        responseMimeType: "application/json",
+      },
     });
 
-    const content = response.choices[0]?.message?.content ?? '{"facts":[]}';
-    
-    // Handle both array and object wrapper responses
+    const result = await model.generateContent(
+      EXTRACTION_PROMPT(chunkText, docName, page)
+    );
+    const text = result.response.text();
+
     let parsed: unknown;
     try {
-      parsed = JSON.parse(content);
+      parsed = JSON.parse(text);
     } catch {
-      console.warn('Failed to parse LLM JSON response:', content.slice(0, 200));
+      console.warn("Failed to parse Gemini JSON response:", text.slice(0, 200));
       return [];
     }
 
+    // Unwrap { facts: [...] } or bare array
     let facts: unknown[];
     if (Array.isArray(parsed)) {
       facts = parsed;
-    } else if (parsed && typeof parsed === 'object' && 'facts' in parsed && Array.isArray((parsed as Record<string, unknown>).facts)) {
+    } else if (
+      parsed &&
+      typeof parsed === "object" &&
+      "facts" in parsed &&
+      Array.isArray((parsed as Record<string, unknown>).facts)
+    ) {
       facts = (parsed as { facts: unknown[] }).facts;
     } else {
-      // Try to find any array in the object
       const values = Object.values(parsed as Record<string, unknown>);
       const arr = values.find((v) => Array.isArray(v));
       facts = Array.isArray(arr) ? arr : [];
     }
 
-    // Validate and filter facts
+    // Validate + grounding check
     return facts
       .filter((f): f is ExtractedFact => {
-        if (!f || typeof f !== 'object') return false;
+        if (!f || typeof f !== "object") return false;
         const fact = f as Partial<ExtractedFact>;
         if (!fact.entity || !fact.attribute || !fact.value || !fact.quote) return false;
-        // Verify quote is actually in the chunk (grounding check)
+        // Grounding: quote must be a substring of the source chunk
         if (!chunkText.includes(fact.quote.trim())) {
-          // Try a relaxed check — first 50 chars of quote
           const shortQuote = fact.quote.trim().slice(0, 50);
           if (!chunkText.includes(shortQuote)) {
-            console.warn(`Discarding fact with unverifiable quote: "${fact.quote.slice(0, 60)}..."`);
+            console.warn(`Discarding ungrounded quote: "${fact.quote.slice(0, 60)}..."`);
             return false;
           }
         }
@@ -111,10 +115,13 @@ export async function extractFactsFromChunk(
         time_scope: f.time_scope ? String(f.time_scope).trim() : undefined,
         qualifiers: Array.isArray(f.qualifiers) ? f.qualifiers.map(String) : [],
         quote: String(f.quote).trim(),
-        confidence: typeof f.confidence === 'number' ? Math.min(1, Math.max(0, f.confidence)) : 0.8,
+        confidence:
+          typeof f.confidence === "number"
+            ? Math.min(1, Math.max(0, f.confidence))
+            : 0.8,
       }));
   } catch (err) {
-    console.error('Extraction error for page', page, ':', err);
+    console.error("Extraction error for page", page, ":", err);
     return [];
   }
 }

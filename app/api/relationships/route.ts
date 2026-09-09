@@ -1,119 +1,92 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { query } from '@/lib/db';
+import { NextRequest, NextResponse } from "next/server";
+import { connectDB } from "@/lib/db/mongoose";
+import { RelationshipModel, FactModel, DocumentModel } from "@/lib/db/models";
+import { Types } from "mongoose";
+import { requireAuth } from "@/lib/auth/session";
+
+export const dynamic = "force-dynamic";
 
 export async function GET(req: NextRequest) {
+  const auth = await requireAuth();
+  if (auth.error) return auth.error;
+  const { userId } = auth;
+
   try {
+    await connectDB();
+
     const { searchParams } = new URL(req.url);
-    const relation = searchParams.get('relation'); // filter by type
-    const docId = searchParams.get('doc_id');
-    const page = Math.max(1, parseInt(searchParams.get('page') ?? '1'));
-    const pageSize = Math.min(100, Math.max(1, parseInt(searchParams.get('page_size') ?? '20')));
+    const relation = searchParams.get("relation");
+    const docId    = searchParams.get("doc_id");
+    const page     = Math.max(1, parseInt(searchParams.get("page") ?? "1"));
+    const pageSize = Math.min(100, Math.max(1, parseInt(searchParams.get("page_size") ?? "20")));
 
-    const conditions: string[] = [];
-    const params: unknown[] = [];
-    let paramIdx = 1;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const filter: Record<string, any> = { userId, relation: { $ne: "unrelated" } };
 
-    if (relation && ['corroborates', 'contradicts', 'reconciled'].includes(relation)) {
-      conditions.push(`r.relation = $${paramIdx++}`);
-      params.push(relation);
+    const validRelations = ["corroborates", "contradicts", "reconciled"];
+    if (relation && validRelations.includes(relation)) {
+      filter.relation = relation;
     }
 
-    if (docId) {
-      conditions.push(`(fa.doc_id = $${paramIdx} OR fb.doc_id = $${paramIdx})`);
-      params.push(docId);
-      paramIdx++;
+    if (docId && Types.ObjectId.isValid(docId)) {
+      const docFacts = await FactModel.find({ userId, docId: new Types.ObjectId(docId) }).select("_id").lean();
+      const ids = docFacts.map((f) => f._id);
+      filter.$or = [{ factIdA: { $in: ids } }, { factIdB: { $in: ids } }];
     }
 
-    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-    const offset = (page - 1) * pageSize;
+    const [relationships, total] = await Promise.all([
+      RelationshipModel.find(filter)
+        .sort({ relation: 1, confidence: -1 })
+        .skip((page - 1) * pageSize)
+        .limit(pageSize)
+        .lean(),
+      RelationshipModel.countDocuments(filter),
+    ]);
 
-    const relationships = await query(
-      `SELECT
-        r.id,
-        r.fact_id_a,
-        r.fact_id_b,
-        r.relation,
-        r.explanation,
-        r.confidence,
-        r.reconciliation_context,
-        r.created_at,
-        -- Fact A
-        fa.entity       AS entity_a,
-        fa.entity_canonical AS entity_canonical_a,
-        fa.attribute    AS attribute_a,
-        fa.value        AS value_a,
-        fa.unit         AS unit_a,
-        fa.time_scope   AS time_scope_a,
-        fa.qualifiers   AS qualifiers_a,
-        fa.quote        AS quote_a,
-        fa.page         AS page_a,
-        fa.confidence   AS confidence_a,
-        da.original_name AS doc_name_a,
-        da.id           AS doc_id_a,
-        -- Fact B
-        fb.entity       AS entity_b,
-        fb.entity_canonical AS entity_canonical_b,
-        fb.attribute    AS attribute_b,
-        fb.value        AS value_b,
-        fb.unit         AS unit_b,
-        fb.time_scope   AS time_scope_b,
-        fb.qualifiers   AS qualifiers_b,
-        fb.quote        AS quote_b,
-        fb.page         AS page_b,
-        fb.confidence   AS confidence_b,
-        db.original_name AS doc_name_b,
-        db.id           AS doc_id_b
-      FROM relationships r
-      JOIN facts fa ON fa.id = r.fact_id_a
-      JOIN facts fb ON fb.id = r.fact_id_b
-      JOIN documents da ON da.id = fa.doc_id
-      JOIN documents db ON db.id = fb.doc_id
-      ${where}
-      ORDER BY
-        CASE r.relation
-          WHEN 'contradicts' THEN 1
-          WHEN 'reconciled'  THEN 2
-          WHEN 'corroborates' THEN 3
-          ELSE 4
-        END,
-        r.confidence DESC
-      LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`,
-      [...params, pageSize, offset]
-    );
+    // Global summary for this user
+    const summaryAgg = await RelationshipModel.aggregate([
+      { $match: { userId, relation: { $ne: "unrelated" } } },
+      { $group: { _id: "$relation", count: { $sum: 1 } } },
+    ]);
+    const summary: Record<string, number> = { corroborates: 0, contradicts: 0, reconciled: 0 };
+    for (const row of summaryAgg) summary[row._id as string] = row.count;
 
-    // Summary counts
-    const summary = await query<{ relation: string; count: string }>(
-      `SELECT r.relation, COUNT(*) as count
-       FROM relationships r
-       JOIN facts fa ON fa.id = r.fact_id_a
-       JOIN facts fb ON fb.id = r.fact_id_b
-       GROUP BY r.relation`
-    );
+    // Populate facts + doc names
+    const allFactIds = [...relationships.map((r) => r.factIdA), ...relationships.map((r) => r.factIdB)];
+    const facts = await FactModel.find({ _id: { $in: allFactIds } }).lean();
+    const factMap = Object.fromEntries(facts.map((f) => [f._id.toString(), f]));
 
-    const summaryMap = summary.reduce(
-      (acc, row) => ({ ...acc, [row.relation]: parseInt(row.count) }),
-      { corroborates: 0, contradicts: 0, reconciled: 0 }
-    );
+    const docIds = [...new Set(facts.map((f) => f.docId.toString()))];
+    const docs = await DocumentModel.find({ _id: { $in: docIds.map((id) => new Types.ObjectId(id)) } }).select("originalName").lean();
+    const docMap = Object.fromEntries(docs.map((d) => [d._id.toString(), d.originalName]));
 
-    const countResult = await query<{ count: string }>(
-      `SELECT COUNT(*) as count
-       FROM relationships r
-       JOIN facts fa ON fa.id = r.fact_id_a
-       JOIN facts fb ON fb.id = r.fact_id_b
-       ${where}`,
-      params
-    );
-    const total = parseInt(countResult[0]?.count ?? '0');
-
-    return NextResponse.json({
-      relationships,
-      total,
-      page,
-      page_size: pageSize,
-      summary: summaryMap,
+    const result = relationships.map((r) => {
+      const fa = factMap[r.factIdA.toString()];
+      const fb = factMap[r.factIdB.toString()];
+      return {
+        id: r._id.toString(),
+        fact_id_a: r.factIdA.toString(),
+        fact_id_b: r.factIdB.toString(),
+        relation: r.relation,
+        explanation: r.explanation,
+        confidence: r.confidence,
+        reconciliation_context: r.reconciliationContext ?? null,
+        created_at: r.createdAt,
+        entity_a: fa?.entity ?? "", entity_canonical_a: fa?.entityCanonical ?? "",
+        attribute_a: fa?.attribute ?? "", value_a: fa?.value ?? "",
+        unit_a: fa?.unit ?? null, time_scope_a: fa?.timeScope ?? null,
+        qualifiers_a: fa?.qualifiers ?? [], quote_a: fa?.quote ?? "",
+        page_a: fa?.page ?? 0, doc_name_a: fa ? (docMap[fa.docId.toString()] ?? "Unknown") : "Unknown",
+        entity_b: fb?.entity ?? "", entity_canonical_b: fb?.entityCanonical ?? "",
+        attribute_b: fb?.attribute ?? "", value_b: fb?.value ?? "",
+        unit_b: fb?.unit ?? null, time_scope_b: fb?.timeScope ?? null,
+        qualifiers_b: fb?.qualifiers ?? [], quote_b: fb?.quote ?? "",
+        page_b: fb?.page ?? 0, doc_name_b: fb ? (docMap[fb.docId.toString()] ?? "Unknown") : "Unknown",
+      };
     });
+
+    return NextResponse.json({ relationships: result, total, page, page_size: pageSize, summary });
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Unknown error';
-    return NextResponse.json({ error: message }, { status: 500 });
+    return NextResponse.json({ error: (err as Error).message }, { status: 500 });
   }
 }

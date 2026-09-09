@@ -1,40 +1,41 @@
-import { NextResponse } from 'next/server';
-import { query } from '@/lib/db';
+import { NextResponse } from "next/server";
+import { connectDB } from "@/lib/db/mongoose";
+import { DocumentModel, FactModel } from "@/lib/db/models";
+import { requireAuth } from "@/lib/auth/session";
+
+export const dynamic = "force-dynamic";
 
 export async function GET() {
-  try {
-    const documents = await query<{
-      id: string;
-      filename: string;
-      original_name: string;
-      file_size: number;
-      page_count: number;
-      status: string;
-      error_message: string | null;
-      created_at: string;
-      updated_at: string;
-      fact_count: number;
-    }>(
-      `SELECT
-        d.id,
-        d.filename,
-        d.original_name,
-        d.file_size,
-        d.page_count,
-        d.status,
-        d.error_message,
-        d.created_at,
-        d.updated_at,
-        COUNT(f.id)::int AS fact_count
-      FROM documents d
-      LEFT JOIN facts f ON f.doc_id = d.id
-      GROUP BY d.id
-      ORDER BY d.created_at DESC`
-    );
+  const auth = await requireAuth();
+  if (auth.error) return auth.error;
+  const { userId } = auth;
 
-    return NextResponse.json({ documents });
+  try {
+    await connectDB();
+
+    const documents = await DocumentModel.find({ userId }).sort({ createdAt: -1 }).lean();
+
+    const counts = await FactModel.aggregate([
+      { $match: { userId } },
+      { $group: { _id: "$docId", count: { $sum: 1 } } },
+    ]);
+    const countMap = Object.fromEntries(counts.map((c) => [c._id.toString(), c.count]));
+
+    const result = documents.map((doc) => ({
+      id: doc._id.toString(),
+      filename: doc.filename,
+      original_name: doc.originalName,
+      file_size: doc.fileSize,
+      page_count: doc.pageCount,
+      status: doc.status,
+      error_message: doc.errorMessage ?? null,
+      created_at: doc.createdAt,
+      updated_at: doc.updatedAt,
+      fact_count: countMap[doc._id.toString()] ?? 0,
+    }));
+
+    return NextResponse.json({ documents: result });
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Unknown error';
-    return NextResponse.json({ error: message }, { status: 500 });
+    return NextResponse.json({ error: (err as Error).message }, { status: 500 });
   }
 }

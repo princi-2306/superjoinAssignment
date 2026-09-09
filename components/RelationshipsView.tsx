@@ -9,14 +9,14 @@ interface RelationshipRow {
   relation: 'corroborates' | 'contradicts' | 'reconciled';
   explanation: string;
   confidence: number;
-  reconciliation_context?: string;
+  reconciliation_context?: string | null;
   // Fact A
   entity_a: string;
   entity_canonical_a: string;
   attribute_a: string;
   value_a: string;
-  unit_a?: string;
-  time_scope_a?: string;
+  unit_a?: string | null;
+  time_scope_a?: string | null;
   qualifiers_a: string[];
   quote_a: string;
   page_a: number;
@@ -27,8 +27,8 @@ interface RelationshipRow {
   entity_canonical_b: string;
   attribute_b: string;
   value_b: string;
-  unit_b?: string;
-  time_scope_b?: string;
+  unit_b?: string | null;
+  time_scope_b?: string | null;
   qualifiers_b: string[];
   quote_b: string;
   page_b: number;
@@ -287,8 +287,8 @@ function FactCard({
   entity: string;
   attribute: string;
   value: string;
-  unit?: string;
-  timeScope?: string;
+  unit?: string | null;
+  timeScope?: string | null;
   qualifiers: string[] | null;
   quote: string;
   page: number;

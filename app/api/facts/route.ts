@@ -1,84 +1,77 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { query } from '@/lib/db';
+import { NextRequest, NextResponse } from "next/server";
+import { connectDB } from "@/lib/db/mongoose";
+import { FactModel, DocumentModel } from "@/lib/db/models";
+import { Types } from "mongoose";
+import { requireAuth } from "@/lib/auth/session";
+
+export const dynamic = "force-dynamic";
 
 export async function GET(req: NextRequest) {
+  const auth = await requireAuth();
+  if (auth.error) return auth.error;
+  const { userId } = auth;
+
   try {
+    await connectDB();
+
     const { searchParams } = new URL(req.url);
-    const page = Math.max(1, parseInt(searchParams.get('page') ?? '1'));
-    const pageSize = Math.min(100, Math.max(1, parseInt(searchParams.get('page_size') ?? '50')));
-    const docId = searchParams.get('doc_id');
-    const entity = searchParams.get('entity');
-    const attribute = searchParams.get('attribute');
-    const search = searchParams.get('search');
+    const page     = Math.max(1, parseInt(searchParams.get("page") ?? "1"));
+    const pageSize = Math.min(100, Math.max(1, parseInt(searchParams.get("page_size") ?? "50")));
+    const docId    = searchParams.get("doc_id");
+    const entity   = searchParams.get("entity");
+    const attribute = searchParams.get("attribute");
+    const search   = searchParams.get("search");
 
-    const conditions: string[] = [];
-    const params: unknown[] = [];
-    let paramIdx = 1;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const filter: Record<string, any> = { userId };
 
-    if (docId) {
-      conditions.push(`f.doc_id = $${paramIdx++}`);
-      params.push(docId);
+    if (docId && Types.ObjectId.isValid(docId)) {
+      filter.docId = new Types.ObjectId(docId);
     }
-    if (entity) {
-      conditions.push(`f.entity_canonical ILIKE $${paramIdx++}`);
-      params.push(`%${entity}%`);
-    }
-    if (attribute) {
-      conditions.push(`f.attribute ILIKE $${paramIdx++}`);
-      params.push(`%${attribute}%`);
-    }
+    if (entity)    filter.entityCanonical = { $regex: entity,    $options: "i" };
+    if (attribute) filter.attribute       = { $regex: attribute, $options: "i" };
     if (search) {
-      conditions.push(
-        `(f.entity_canonical ILIKE $${paramIdx} OR f.attribute ILIKE $${paramIdx} OR f.value ILIKE $${paramIdx} OR f.quote ILIKE $${paramIdx})`
-      );
-      params.push(`%${search}%`);
-      paramIdx++;
+      filter.$or = [
+        { entityCanonical: { $regex: search, $options: "i" } },
+        { attribute:       { $regex: search, $options: "i" } },
+        { value:           { $regex: search, $options: "i" } },
+        { quote:           { $regex: search, $options: "i" } },
+      ];
     }
 
-    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-    const offset = (page - 1) * pageSize;
+    const [facts, total] = await Promise.all([
+      FactModel.find(filter).sort({ createdAt: -1 }).skip((page - 1) * pageSize).limit(pageSize).lean(),
+      FactModel.countDocuments(filter),
+    ]);
 
-    const facts = await query(
-      `SELECT
-        f.id,
-        f.doc_id,
-        f.entity,
-        f.entity_canonical,
-        f.attribute,
-        f.value,
-        f.value_normalized,
-        f.unit,
-        f.time_scope,
-        f.qualifiers,
-        f.quote,
-        f.page,
-        f.char_start,
-        f.char_end,
-        f.confidence,
-        f.created_at,
-        d.original_name AS doc_name
-      FROM facts f
-      JOIN documents d ON d.id = f.doc_id
-      ${where}
-      ORDER BY f.created_at DESC
-      LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`,
-      [...params, pageSize, offset]
-    );
+    const docIds = [...new Set(facts.map((f) => f.docId.toString()))];
+    const docs = await DocumentModel.find({
+      _id: { $in: docIds.map((id) => new Types.ObjectId(id)) },
+    }).select("originalName").lean();
+    const docNameMap = Object.fromEntries(docs.map((d) => [d._id.toString(), d.originalName]));
 
-    const countResult = await query<{ count: string }>(
-      `SELECT COUNT(*) as count FROM facts f ${where}`,
-      params
-    );
-    const total = parseInt(countResult[0]?.count ?? '0');
+    const result = facts.map((f) => ({
+      id:               f._id.toString(),
+      doc_id:           f.docId.toString(),
+      doc_name:         docNameMap[f.docId.toString()] ?? "Unknown",
+      entity:           f.entity,
+      entity_canonical: f.entityCanonical,
+      attribute:        f.attribute,
+      value:            f.value,
+      value_normalized: f.valueNormalized ?? null,
+      unit:             f.unit ?? null,
+      time_scope:       f.timeScope ?? null,
+      qualifiers:       f.qualifiers,
+      quote:            f.quote,
+      page:             f.page,
+      char_start:       f.charStart,
+      char_end:         f.charEnd,
+      confidence:       f.confidence,
+      created_at:       f.createdAt,
+    }));
 
-    return NextResponse.json({
-      facts,
-      total,
-      page,
-      page_size: pageSize,
-    });
+    return NextResponse.json({ facts: result, total, page, page_size: pageSize });
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Unknown error';
-    return NextResponse.json({ error: message }, { status: 500 });
+    return NextResponse.json({ error: (err as Error).message }, { status: 500 });
   }
 }

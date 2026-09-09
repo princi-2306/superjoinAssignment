@@ -1,12 +1,12 @@
-import OpenAI from 'openai';
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
-let client: OpenAI | null = null;
+let client: GoogleGenerativeAI | null = null;
 
-export function getOpenAI(): OpenAI {
+export function getGemini(): GoogleGenerativeAI {
   if (!client) {
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) throw new Error('OPENAI_API_KEY is not set');
-    client = new OpenAI({ apiKey });
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) throw new Error("GEMINI_API_KEY is not set");
+    client = new GoogleGenerativeAI(apiKey);
   }
   return client;
 }
