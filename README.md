@@ -6,7 +6,7 @@ A full-stack system that extracts meaningful facts from PDFs, grounds every fact
 
 ## Video Demo
 
-> 📹 _Link to be added after recording_
+> https://www.loom.com/share/2e05260c4d80406ba201b3cafb07bb5a
 
 ---
 
