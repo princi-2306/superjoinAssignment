@@ -3,15 +3,16 @@
 import { useState, FormEvent } from "react";
 import { signIn } from "next-auth/react";
 import { useRouter } from "next/navigation";
+import api from "@/lib/api/axios";
 
 export default function LoginPage() {
   const router = useRouter();
-  const [mode, setMode]       = useState<"login" | "register">("login");
-  const [name, setName]       = useState("");
-  const [email, setEmail]     = useState("");
+  const [mode, setMode]         = useState<"login" | "register">("login");
+  const [name, setName]         = useState("");
+  const [email, setEmail]       = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError]     = useState("");
-  const [loading, setLoading] = useState(false);
+  const [error, setError]       = useState("");
+  const [loading, setLoading]   = useState(false);
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -20,14 +21,8 @@ export default function LoginPage() {
 
     try {
       if (mode === "register") {
-        const res = await fetch("/api/auth/register", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email, password, name }),
-        });
-        const data = await res.json();
-        if (!res.ok) { setError(data.error ?? "Registration failed"); return; }
-        // Auto-sign-in after register
+        await api.post("/api/auth/register", { email, password, name });
+        // falls through to signIn on success
       }
 
       const result = await signIn("credentials", {
@@ -40,8 +35,8 @@ export default function LoginPage() {
         router.push("/");
         router.refresh();
       }
-    } catch {
-      setError("Something went wrong. Please try again.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Something went wrong. Please try again.");
     } finally {
       setLoading(false);
     }

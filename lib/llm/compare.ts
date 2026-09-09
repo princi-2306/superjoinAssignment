@@ -47,6 +47,7 @@ export async function compareFacts(
   const gemini = getGemini();
 
   try {
+    console.log('[llm/compare] Comparing facts:', factA.id, factB.id);
     const model = gemini.getGenerativeModel({
       model: "gemini-1.5-flash",
       generationConfig: {
@@ -58,6 +59,7 @@ export async function compareFacts(
 
     const result = await model.generateContent(COMPARISON_PROMPT(factA, factB));
     const text = result.response.text();
+    console.log('[llm/compare] Gemini response text (truncated):', text.slice(0, 300));
     const parsed = JSON.parse(text) as Partial<ComparisonResult>;
 
     const validRelations: RelationType[] = [
@@ -80,7 +82,7 @@ export async function compareFacts(
       reconciliation_context: parsed.reconciliation_context,
     };
   } catch (err) {
-    console.error("Comparison error:", err);
+    console.error("[llm/compare] Comparison error:", err);
     return {
       relation: "unrelated",
       explanation: "Comparison failed due to an internal error",

@@ -8,6 +8,7 @@ import DocumentList from "@/components/DocumentList";
 import FactsTable from "@/components/FactsTable";
 import RelationshipsView from "@/components/RelationshipsView";
 import FourCasesPanel from "@/components/FourCasesPanel";
+import api from "@/lib/api/axios";
 import { Document, Fact } from "@/types";
 
 type Tab = "upload" | "facts" | "relationships" | "cases";
@@ -65,25 +66,23 @@ export default function Home() {
   const fetchDocuments = useCallback(async () => {
     setDocsLoading(true);
     try {
-      const res = await fetch("/api/documents");
-      if (!res.ok) return;
-      const data = await res.json();
+      const { data } = await api.get("/api/documents");
       setDocuments(data.documents ?? []);
-    } finally { setDocsLoading(false); }
+    } catch { /* silently ignore — user sees empty state */ }
+    finally { setDocsLoading(false); }
   }, []);
 
   const fetchFacts = useCallback(async () => {
     setFactsLoading(true);
     try {
       const p = new URLSearchParams({ page: String(factsPage), page_size: String(PAGE_SIZE) });
-      if (factsSearch)    p.set("search",  factsSearch);
-      if (factsDocFilter) p.set("doc_id",  factsDocFilter);
-      const res = await fetch(`/api/facts?${p}`);
-      if (!res.ok) return;
-      const data = await res.json();
+      if (factsSearch)    p.set("search", factsSearch);
+      if (factsDocFilter) p.set("doc_id", factsDocFilter);
+      const { data } = await api.get(`/api/facts?${p}`);
       setFacts(data.facts ?? []);
       setFactsTotal(data.total ?? 0);
-    } finally { setFactsLoading(false); }
+    } catch { /* silently ignore */ }
+    finally { setFactsLoading(false); }
   }, [factsPage, factsSearch, factsDocFilter]);
 
   const fetchRelationships = useCallback(async () => {
@@ -91,24 +90,22 @@ export default function Home() {
     try {
       const p = new URLSearchParams({ page: String(relPage), page_size: String(PAGE_SIZE) });
       if (relFilter) p.set("relation", relFilter);
-      const res = await fetch(`/api/relationships?${p}`);
-      if (!res.ok) return;
-      const data = await res.json();
+      const { data } = await api.get(`/api/relationships?${p}`);
       setRelationships(data.relationships ?? []);
       setRelTotal(data.total ?? 0);
       setRelSummary(data.summary ?? { corroborates: 0, contradicts: 0, reconciled: 0 });
-    } finally { setRelLoading(false); }
+    } catch { /* silently ignore */ }
+    finally { setRelLoading(false); }
   }, [relPage, relFilter]);
 
   const fetchAllRelationships = useCallback(async () => {
     setCasesLoading(true);
     try {
-      const res = await fetch("/api/relationships?page=1&page_size=100");
-      if (!res.ok) return;
-      const data = await res.json();
+      const { data } = await api.get("/api/relationships?page=1&page_size=100");
       setAllRelationships(data.relationships ?? []);
       setRelSummary(data.summary ?? { corroborates: 0, contradicts: 0, reconciled: 0 });
-    } finally { setCasesLoading(false); }
+    } catch { /* silently ignore */ }
+    finally { setCasesLoading(false); }
   }, []);
 
   useEffect(() => { if (status === "authenticated") fetchDocuments(); }, [status, fetchDocuments]);

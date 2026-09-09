@@ -507,3 +507,69 @@ The grounding requirement is what keeps this from being unusable. By requiring e
 
 - **Google Gemini 1.5 Flash** — all LLM work: fact extraction per chunk and pairwise relationship classification
 - **Kiro AI (Claude)** — pair programming throughout: architecture design, pipeline scaffolding, debugging OOM crashes, TypeScript type fixes, and documentation
+
+---
+
+## Interviewer Guide — quick verification
+
+Follow these steps to run the project, reproduce the four required cases, and inspect the console logs that show how extraction, grounding, and comparison work.
+
+1. Install & env
+
+```bash
+npm install
+# create .env.local as documented above (MONGODB_URI, NEXTAUTH_SECRET, NEXT_PUBLIC_APP_URL)
+```
+
+2. Seed demo cases (optional but recommended)
+
+```bash
+node scripts/seed-demo.js
+```
+
+3. Start dev server (normal)
+
+```bash
+npm run dev
+```
+
+If you need a larger Node heap for large PDFs (temporary):
+
+```bash
+npm run dev:heap
+```
+
+4. Open the app
+
+Visit `http://localhost:3000`, register/login, and go to the **Four Cases** tab. The seeded demo contains one example for each required case.
+
+5. Upload a PDF to test the pipeline
+
+- Use the Upload area. The server console (where you ran `npm run dev`) will print detailed logs for each step:
+      - `[upload] parseMultipartFiles: called` — multer bridge received the request
+      - `[upload] multer parsed N file(s)` — temp files created in `/tmp`
+      - `[api/upload] reading file from disk:` — file read length
+      - `[parse] parsePdf: starting pdf-parse` and per-page logs — page lengths
+      - `[llm/extract] Extracting facts from doc=..., page=..., chunk_len=...` — LLM calls
+      - `[llm/extract] Parsed fact: ...` — each parsed fact that passed grounding
+      - `[docId] Creating fact: ...` — DB writes for facts
+      - `[llm/compare] Comparing facts: ...` and `[llm/compare] Gemini response text` — comparison calls and results
+      - `[docId] Creating relationship between ...` — relationship writes
+
+6. Verify the four cases
+
+- **Corroboration / Contradiction / Reconciled** — open the **Relationships** tab or **Four Cases** panel to see relationships and explanations selected by confidence.
+- **Extraction failure** — check the console logs for warnings like `Discarding ungrounded quote:`; the UI will not show discarded facts.
+
+7. Troubleshooting
+
+- If the server crashes with OOM on very large PDFs, use `npm run dev:heap` or process files smaller or offset into a worker queue (recommended future step).
+- If Next.js build fails due to a runtime error, check the server console for the stack trace and the log prefixes above — I added detailed logs to `lib/upload/multer.ts`, `app/api/upload/route.ts`, `lib/pipeline/parse.ts`, `lib/pipeline/ingest.ts`, `lib/llm/extract.ts`, and `lib/llm/compare.ts` to aid debugging.
+
+8. What to include in your demo video
+
+- Show `npm run dev` console output while uploading a PDF.
+- Show the **Four Cases** tab demonstrating corroboration, contradiction, and reconciliation with source quotes.
+- Point out one extraction failure and explain how the grounding check caught it and how you'd fix it (table-aware extraction).
+
+If you'd like, I can also scaffold an async job queue (BullMQ + Redis) so uploads return immediately and processing runs in background — this is the next production-grade improvement.

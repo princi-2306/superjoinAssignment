@@ -3,6 +3,7 @@
 import { useCallback, useState } from 'react';
 import { useDropzone } from 'react-dropzone';
 import toast from 'react-hot-toast';
+import api from '@/lib/api/axios';
 
 interface UploadResult {
   doc_id?: string;
@@ -37,21 +38,12 @@ export default function UploadZone({ onUploadComplete }: UploadZoneProps) {
       try {
         setProgress((p) => [...p, 'Parsing PDFs and extracting chunks...']);
 
-        const res = await fetch('/api/upload', {
-          method: 'POST',
-          body: formData,
+        const { data } = await api.post<{ results: UploadResult[] }>('/api/upload', formData, {
+          headers: { 'Content-Type': 'multipart/form-data' },
         });
 
-        const data = await res.json();
-
-        if (!res.ok) {
-          throw new Error(data.error ?? 'Upload failed');
-        }
-
-        const results: UploadResult[] = data.results;
         const logs: string[] = [];
-
-        for (const r of results) {
+        for (const r of data.results) {
           if (r.error) {
             logs.push(`✗ ${r.filename}: ${r.error}`);
             toast.error(`Failed: ${r.filename}`);
@@ -59,9 +51,7 @@ export default function UploadZone({ onUploadComplete }: UploadZoneProps) {
             logs.push(`⟳ ${r.filename}: already in knowledge layer`);
             toast(`Skipped duplicate: ${r.filename}`, { icon: '⟳' });
           } else {
-            logs.push(
-              `✓ ${r.filename}: ${r.facts_extracted} facts, ${r.relationships_found} relationships`
-            );
+            logs.push(`✓ ${r.filename}: ${r.facts_extracted} facts, ${r.relationships_found} relationships`);
             toast.success(`Processed: ${r.filename}`);
           }
         }

@@ -103,149 +103,145 @@ export async function ingestDocument(
     const { pages, totalPages } = await parsePdf(buffer);
     await DocumentModel.updateOne({ _id: docId }, { pageCount: totalPages });
 
-    // ── Chunk ──────────────────────────────────────────────────────────────
-    const allChunks = pages.flatMap((text, i) =>
-      chunkPage(text, docId.toString(), i + 1)
-    );
-
-    // ── Batch-insert chunks ────────────────────────────────────────────────
-    for (let i = 0; i < allChunks.length; i += 100) {
-      const batch = allChunks.slice(i, i + 100);
-      await ChunkModel.insertMany(
-        batch.map((c) => ({
-          docId,
-          userId,
-          page: c.page,
-          chunkIndex: c.chunk_index,
-          text: c.text,
-          charStart: c.char_start,
-          charEnd: c.char_end,
-        })),
-        { ordered: false }
-      );
-    }
-
     // ── Known canonicals scoped to this user ──────────────────────────────
     const knownDocs = await FactModel.distinct("entityCanonical", { userId });
     const knownCanonicals: string[] = [...knownDocs];
 
-    // ── Extract facts (concurrency = 3) ───────────────────────────────────
-    console.log(`[${docId}] Extracting from ${allChunks.length} chunks…`);
-    const insertedFactIds: Types.ObjectId[] = [];
+    // ── Extract and process per-page to avoid retaining all chunks in memory
+    console.log(`[${docId}] Extracting from ${pages.length} pages (streamed per-page)…`);
     const CONCURRENCY = 3;
+    let relationshipsFound = 0;
+    let factsExtractedCount = 0;
 
-    for (let i = 0; i < allChunks.length; i += CONCURRENCY) {
-      const batch = allChunks.slice(i, i + CONCURRENCY);
-      const results = await Promise.all(
-        batch.map((chunk) =>
-          extractFactsFromChunk(chunk.text, originalName, chunk.page)
-        )
-      );
+    for (let p = 0; p < pages.length; p++) {
+      const pageText = pages[p];
+      const pageNumber = p + 1;
 
-      for (let j = 0; j < batch.length; j++) {
-        const chunk = batch[j];
-        for (const ef of results[j]) {
-          const entityCanonical = resolveEntityCanonical(ef.entity, knownCanonicals);
-          if (!knownCanonicals.includes(entityCanonical)) {
-            knownCanonicals.push(entityCanonical);
-          }
+      // Chunk the page (keeps only one page of chunks in memory at a time)
+      const pageChunks = chunkPage(pageText, docId.toString(), pageNumber);
 
-          const quoteIdx = chunk.text.indexOf(ef.quote);
-          const charStart = quoteIdx >= 0 ? chunk.char_start + quoteIdx : chunk.char_start;
-          const charEnd   = quoteIdx >= 0 ? charStart + ef.quote.length  : chunk.char_end;
-
-          const fact = await FactModel.create({
+      // Insert chunks for this page in batches
+      for (let i = 0; i < pageChunks.length; i += 100) {
+        const batch = pageChunks.slice(i, i + 100);
+        await ChunkModel.insertMany(
+          batch.map((c) => ({
             docId,
             userId,
-            entity:          normalizeEntityName(ef.entity),
-            entityCanonical,
-            attribute:       normalizeAttribute(ef.attribute),
-            value:           ef.value,
-            valueNormalized: normalizeNumericValue(ef.value, ef.unit) ?? undefined,
-            unit:      ef.unit,
-            timeScope: ef.time_scope,
-            qualifiers: ef.qualifiers,
-            quote:      ef.quote,
-            page:       chunk.page,
-            charStart,
-            charEnd,
-            confidence: ef.confidence,
-          });
-
-          insertedFactIds.push(fact._id);
-        }
+            page: c.page,
+            chunkIndex: c.chunk_index,
+            text: c.text,
+            charStart: c.char_start,
+            charEnd: c.char_end,
+          })),
+          { ordered: false }
+        );
       }
-    }
 
-    console.log(`[${docId}] Extracted ${insertedFactIds.length} facts`);
+      // Extract and immediately persist/compare facts for this page's chunks
+      for (let i = 0; i < pageChunks.length; i += CONCURRENCY) {
+        const batch = pageChunks.slice(i, i + CONCURRENCY);
+        const results = await Promise.all(
+          batch.map((chunk) => extractFactsFromChunk(chunk.text, originalName, chunk.page))
+        );
 
-    // ── Comparison engine — only within this user's knowledge base ─────────
-    let relationshipsFound = 0;
+        for (let j = 0; j < batch.length; j++) {
+          const chunk = batch[j];
+          for (const ef of results[j]) {
+            const entityCanonical = resolveEntityCanonical(ef.entity, knownCanonicals);
+            if (!knownCanonicals.includes(entityCanonical)) knownCanonicals.push(entityCanonical);
 
-    if (insertedFactIds.length > 0) {
-      console.log(`[${docId}] Comparing against user's existing facts…`);
+            const quoteIdx = chunk.text.indexOf(ef.quote);
+            const charStart = quoteIdx >= 0 ? chunk.char_start + quoteIdx : chunk.char_start;
+            const charEnd = quoteIdx >= 0 ? charStart + ef.quote.length : chunk.char_end;
 
-      const newFacts = await FactModel.find({ _id: { $in: insertedFactIds } }).lean<IFact[]>();
-
-      for (const nf of newFacts) {
-        // Exact: same user, same entity+attribute, different document
-        const exactCandidates = await FactModel.find({
-          userId,
-          docId: { $ne: docId },
-          entityCanonical: nf.entityCanonical,
-          attribute: nf.attribute,
-          _id: { $nin: insertedFactIds },
-        }).limit(5).lean<IFact[]>();
-
-        // Broad: same user, same attribute, different entity spelling
-        const broadCandidates = await FactModel.find({
-          userId,
-          docId: { $ne: docId },
-          attribute: nf.attribute,
-          entityCanonical: { $ne: nf.entityCanonical },
-          _id: { $nin: [...insertedFactIds, ...exactCandidates.map((c) => c._id)] },
-        }).limit(3).lean<IFact[]>();
-
-        for (const candidate of [...exactCandidates, ...broadCandidates]) {
-          const [idA, idB] =
-            nf._id.toString() < candidate._id.toString()
-              ? [nf._id, candidate._id]
-              : [candidate._id, nf._id];
-
-          const exists = await RelationshipModel.exists({ userId, factIdA: idA, factIdB: idB });
-          if (exists) continue;
-
-          // Fetch doc names for the comparison prompt
-          const [docA, docB] = await Promise.all([
-            DocumentModel.findById(nf.docId).select("originalName").lean(),
-            DocumentModel.findById(candidate.docId).select("originalName").lean(),
-          ]);
-
-          const factA = docToFact({ ...nf, docName: docA?.originalName ?? originalName } as IFact & { docName: string });
-          const factB = docToFact({ ...candidate, docName: docB?.originalName ?? "" } as IFact & { docName: string });
-
-          const result = await compareFacts(factA, factB);
-
-          if (result.relation !== "unrelated") {
-            await RelationshipModel.create({
+            console.log(`[${docId}] Creating fact: entity="${ef.entity}", attribute="${ef.attribute}", page=${chunk.page}`);
+            const factDoc = await FactModel.create({
+              docId,
               userId,
-              factIdA: idA,
-              factIdB: idB,
-              relation: result.relation,
-              explanation: result.explanation,
-              confidence: result.confidence,
-              reconciliationContext: result.reconciliation_context,
-            }).catch(() => { /* duplicate race — ignore */ });
-            relationshipsFound++;
+              entity: normalizeEntityName(ef.entity),
+              entityCanonical,
+              attribute: normalizeAttribute(ef.attribute),
+              value: ef.value,
+              valueNormalized: normalizeNumericValue(ef.value, ef.unit) ?? undefined,
+              unit: ef.unit,
+              timeScope: ef.time_scope,
+              qualifiers: ef.qualifiers,
+              quote: ef.quote,
+              page: chunk.page,
+              charStart,
+              charEnd,
+              confidence: ef.confidence,
+            });
+
+            factsExtractedCount++;
+
+            // Immediately compare this new fact against existing facts in the user's KB
+            const nf = factDoc.toObject() as IFact;
+
+            // Exact: same user, same entity+attribute, different document
+            const exactCandidates = await FactModel.find({
+              userId,
+              docId: { $ne: docId },
+              entityCanonical: nf.entityCanonical,
+              attribute: nf.attribute,
+              _id: { $ne: nf._id },
+            }).limit(5).lean<IFact[]>();
+
+            // Broad: same user, same attribute, different entity spelling
+            const broadCandidates = await FactModel.find({
+              userId,
+              docId: { $ne: docId },
+              attribute: nf.attribute,
+              entityCanonical: { $ne: nf.entityCanonical },
+              _id: { $ne: nf._id },
+            }).limit(3).lean<IFact[]>();
+
+            for (const candidate of [...exactCandidates, ...broadCandidates]) {
+              const [idA, idB] =
+                nf._id.toString() < candidate._id.toString()
+                  ? [nf._id, candidate._id]
+                  : [candidate._id, nf._id];
+
+              const exists = await RelationshipModel.exists({ userId, factIdA: idA, factIdB: idB });
+              if (exists) continue;
+
+              const [docA, docB] = await Promise.all([
+                DocumentModel.findById(nf.docId).select("originalName").lean(),
+                DocumentModel.findById(candidate.docId).select("originalName").lean(),
+              ]);
+
+              const factA = docToFact({ ...nf, docName: docA?.originalName ?? originalName } as IFact & { docName: string });
+              const factB = docToFact({ ...candidate, docName: docB?.originalName ?? "" } as IFact & { docName: string });
+
+              const result = await compareFacts(factA, factB);
+
+              if (result.relation !== "unrelated") {
+                console.log(`[${docId}] Creating relationship between ${idA} and ${idB}: ${result.relation} (confidence=${result.confidence})`);
+                await RelationshipModel.create({
+                  userId,
+                  factIdA: idA,
+                  factIdB: idB,
+                  relation: result.relation,
+                  explanation: result.explanation,
+                  confidence: result.confidence,
+                  reconciliationContext: result.reconciliation_context,
+                }).catch(() => { /* duplicate race — ignore */ });
+                relationshipsFound++;
+              }
+            }
           }
         }
       }
+
+      // Allow the per-page data to be GC'd by letting references go out of scope
     }
 
-    await DocumentModel.updateOne({ _id: docId }, { status: "completed" });
-    console.log(`[${docId}] Done — facts: ${insertedFactIds.length}, rels: ${relationshipsFound}`);
+    console.log(`[${docId}] Done — relationships found: ${relationshipsFound}`);
 
-    return { docId: docId.toString(), factsExtracted: insertedFactIds.length, relationshipsFound, skippedDuplicate: false };
+    await DocumentModel.updateOne({ _id: docId }, { status: "completed" });
+    console.log(`[${docId}] Done — facts: ${factsExtractedCount}, rels: ${relationshipsFound}`);
+
+    return { docId: docId.toString(), factsExtracted: factsExtractedCount, relationshipsFound, skippedDuplicate: false };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[${docId}] Failed:`, msg);

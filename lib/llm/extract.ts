@@ -52,6 +52,7 @@ export async function extractFactsFromChunk(
   const gemini = getGemini();
 
   try {
+    console.log(`[llm/extract] Extracting facts from doc="${docName}", page=${page}, chunk_len=${chunkText.length}`);
     const model = gemini.getGenerativeModel({
       model: "gemini-1.5-flash",
       generationConfig: {
@@ -70,7 +71,7 @@ export async function extractFactsFromChunk(
     try {
       parsed = JSON.parse(text);
     } catch {
-      console.warn("Failed to parse Gemini JSON response:", text.slice(0, 200));
+      console.warn("[llm/extract] Failed to parse Gemini JSON response:", text.slice(0, 200));
       return [];
     }
 
@@ -92,7 +93,7 @@ export async function extractFactsFromChunk(
     }
 
     // Validate + grounding check
-    return facts
+    const extracted = facts
       .filter((f): f is ExtractedFact => {
         if (!f || typeof f !== "object") return false;
         const fact = f as Partial<ExtractedFact>;
@@ -120,8 +121,14 @@ export async function extractFactsFromChunk(
             ? Math.min(1, Math.max(0, f.confidence))
             : 0.8,
       }));
+
+    extracted.forEach((ef) => {
+      console.log(`[llm/extract] Parsed fact: entity="${ef.entity}", attribute="${ef.attribute}", quote_len=${ef.quote.length}`);
+    });
+
+    return extracted;
   } catch (err) {
-    console.error("Extraction error for page", page, ":", err);
+    console.error("[llm/extract] Extraction error for page", page, ":", err);
     return [];
   }
 }

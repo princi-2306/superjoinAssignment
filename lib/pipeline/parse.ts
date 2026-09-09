@@ -7,6 +7,7 @@ export async function parsePdf(buffer: Buffer): Promise<{ pages: string[]; total
 
   const pageTexts: string[] = [];
 
+  console.log('[parse] parsePdf: starting pdf-parse');
   // pdf-parse gives us the full text; we also want per-page breakdown
   const data = await pdfParse(buffer, {
     // Render page-by-page
@@ -31,6 +32,7 @@ export async function parsePdf(buffer: Buffer): Promise<{ pages: string[]; total
           .join('\n');
 
         pageTexts.push(pageText);
+        console.log(`[parse] page ${pageTexts.length} extracted, length=${pageText.length}`);
         return pageText;
       });
     },
@@ -38,8 +40,10 @@ export async function parsePdf(buffer: Buffer): Promise<{ pages: string[]; total
 
   // If custom renderer didn't populate (can happen with some PDFs), fall back to splitting by form feeds
   if (pageTexts.length === 0 && data.text) {
+    console.log('[parse] fallback: splitting data.text into pages');
     const split = data.text.split(/\f|\n{5,}/);
     pageTexts.push(...split.filter(Boolean));
+    console.log('[parse] fallback produced', pageTexts.length, 'pages');
   }
 
   return {

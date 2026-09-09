@@ -70,20 +70,30 @@ function toNodeRequest(req: NextRequest): IncomingMessage {
 
 export function parseMultipartFiles(req: NextRequest): Promise<UploadedFile[]> {
   return new Promise((resolve, reject) => {
+    console.log('[upload] parseMultipartFiles: called');
     const nodeReq = toNodeRequest(req);
+
+    console.log('[upload] headers:', Object.fromEntries(req.headers.entries()));
 
     // Multer only touches req — it never writes to res in diskStorage mode.
     // Cast to `never` so TypeScript doesn't argue about the Express Response shape.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     upload.array("files")(nodeReq as never, {} as never, (err) => {
-      if (err) return reject(err);
+      if (err) {
+        console.error('[upload] multer error:', err && (err as Error).message ? (err as Error).message : err);
+        return reject(err);
+      }
 
       const files = (nodeReq as unknown as { files?: Express.Multer.File[] })
         .files as Express.Multer.File[] | undefined;
 
       if (!files || files.length === 0) {
+        console.log('[upload] no files parsed by multer');
         return resolve([]);
       }
+
+      console.log(`[upload] multer parsed ${files.length} file(s)`);
+      for (const f of files) console.log('[upload] file:', f.originalname, f.path, f.size);
 
       resolve(
         files.map((f) => ({

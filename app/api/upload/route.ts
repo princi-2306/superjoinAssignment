@@ -15,7 +15,9 @@ export async function POST(req: NextRequest) {
   const tempPaths: string[] = [];
 
   try {
+    console.log('[api/upload] POST called by user:', userId?.toString?.() ?? userId);
     const files = await parseMultipartFiles(req);
+    console.log('[api/upload] parseMultipartFiles returned', files.length, 'files');
 
     if (files.length === 0) {
       return NextResponse.json({ error: "No PDF files provided" }, { status: 400 });
@@ -26,8 +28,11 @@ export async function POST(req: NextRequest) {
     for (const file of files) {
       tempPaths.push(file.path);
       try {
+        console.log('[api/upload] reading file from disk:', file.path);
         const buffer = fs.readFileSync(file.path);
+        console.log('[api/upload] read buffer length:', buffer.length);
         const result = await ingestDocument(buffer, file.originalname, userId);
+        console.log('[api/upload] ingestDocument result:', result);
 
         results.push({
           doc_id: result.docId,
