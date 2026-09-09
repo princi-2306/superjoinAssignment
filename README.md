@@ -151,88 +151,64 @@ A dedicated table-extraction pre-pass using [Camelot](https://camelot-py.readthe
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                            BROWSER / CLIENT                             │
-│                                                                         │
-│  ┌──────────┐  ┌──────────┐  ┌────────────────┐  ┌──────────────────┐  │
-│  │  Login / │  │  Upload  │  │  Facts Table   │  │  Relationships / │  │
-│  │ Register │  │   Zone   │  │ + Evidence     │  │  Four Cases Tab  │  │
-│  └────┬─────┘  └────┬─────┘  └───────┬────────┘  └────────┬─────────┘  │
-└───────┼─────────────┼────────────────┼────────────────────┼────────────┘
-        │             │                │                    │
-        │  next-auth  │  POST /upload  │  GET /facts        │  GET /relationships
-        ▼             ▼                ▼                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         NEXT.JS APP ROUTER (API)                        │
-│                                                                         │
-│  /api/auth/[...nextauth]   →  JWT issued, userId embedded in token      │
-│  /api/auth/register        →  bcrypt hash, UserModel.create()           │
-│  /api/upload               →  requireAuth() → Multer → ingestDocument() │
-│  /api/documents            →  requireAuth() → DocumentModel.find({userId})│
-│  /api/facts                →  requireAuth() → FactModel.find({userId})  │
-│  /api/facts/[id]           →  requireAuth() → fact + chunks + rels      │
-│  /api/relationships        →  requireAuth() → RelationshipModel.find()  │
-└──────────────────────────────────┬──────────────────────────────────────┘
-                                   │
-                    ┌──────────────▼──────────────┐
-                    │      INGEST PIPELINE        │
-                    │                             │
-                    │  1. Multer disk storage     │
-                    │     File → /tmp (no OOM)    │
-                    │                             │
-                    │  2. pdf-parse               │
-                    │     Pages + char offsets    │
-                    │                             │
-                    │  3. Chunker                 │
-                    │     1200 chars, 200 overlap │
-                    │     Sentence-boundary aware │
-                    │                             │
-                    │  4. Gemini 1.5 Flash        │
-                    │     Extract facts per chunk │
-                    │     Concurrency = 3         │
-                    │     Grounding check ✓       │
-                    │                             │
-                    │  5. Normalizer              │
-                    │     Entity → canonical      │
-                    │     Value → float + unit    │
-                    │                             │
-                    │  6. MongoDB write           │
-                    │     Document / Chunk / Fact │
-                    │     all stamped with userId │
-                    │                             │
-                    │  7. Comparison engine       │
-                    │     Candidate retrieval     │
-                    │     Gemini classify pair    │
-                    │     Store relationship      │
-                    └──────────────┬──────────────┘
-                                   │
-                    ┌──────────────▼──────────────┐
-                    │          MONGODB            │
-                    │                             │
-                    │  users                      │
-                    │    email, passwordHash       │
-                    │                             │
-                    │  documents                  │
-                    │    userId, status, hash      │
-                    │                             │
-                    │  chunks                     │
-                    │    docId, userId, text       │
-                    │    charStart, charEnd        │
-                    │                             │
-                    │  facts                      │
-                    │    userId, docId             │
-                    │    entity, attribute, value  │
-                    │    unit, timeScope           │
-                    │    qualifiers[]  ← dynamic  │
-                    │    quote (grounded)          │
-                    │    confidence                │
-                    │                             │
-                    │  relationships              │
-                    │    userId, factIdA, factIdB  │
-                    │    relation, explanation     │
-                    │    reconciliationContext     │
-                    └─────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph CLIENT["Browser / Client"]
+        UI["React UI<br/>(Login / Upload / Facts / Relationships)"]
+    end
+
+    subgraph NEXT["Next.js App Router (API)"]
+        Auth["/api/auth/[...nextauth]<br/>/api/auth/register"]
+        Upload["/api/upload"]
+        Docs["/api/documents<br/>/api/facts<br/>/api/facts/:id<br/>/api/relationships"]
+    end
+
+    subgraph UPLOAD["Upload Handling"]
+        Multer["Multer (diskStorage)<br/>writes to /tmp"]
+        Ingest["Ingest Pipeline"]
+    end
+
+    subgraph PIPELINE["Ingest Pipeline"]
+        Parse["PDF parse (pdf-parse)<br/>per-page text"]
+        Chunk["Chunker (1200 chars, 200 overlap)"]
+        LLMExtract["LLM Extract (Gemini)<br/>per-chunk JSON"]
+        Normalize["Normalizer"]
+        Compare["LLM Compare (Gemini)<br/>candidate retrieval"]
+    end
+
+    subgraph DB["MongoDB"]
+        Documents[("documents")]
+        Chunks[("chunks")]
+        Facts[("facts")]
+        Relationships[("relationships")]
+        Users[("users")]
+    end
+
+    UI -->|auth & API calls| NEXT
+    NEXT --> Auth
+    NEXT --> Upload
+    NEXT --> Docs
+    Upload --> Multer
+    Multer --> Ingest
+    Ingest --> Parse
+    Parse --> Chunk
+    Chunk --> Chunks
+    Chunk --> LLMExtract
+    LLMExtract --> Facts
+    Facts --> Normalize
+    Normalize --> Facts
+    Facts --> Compare
+    Compare --> Relationships
+    Ingest --> Documents
+    NEXT --> Users
+    Docs --> Facts
+    Docs --> Relationships
+    Docs --> Documents
+
+    style CLIENT fill:#0f172a,stroke:#111827,color:#e6edf3
+    style NEXT fill:#0b1220,stroke:#22303f,color:#cfe8ff
+    style DB fill:#071126,stroke:#1b3a66,color:#dbeeff
+    style PIPELINE fill:#061022,stroke:#123047,color:#dbeeff
 ```
 
 ### Data Flow for a New Upload
@@ -506,70 +482,5 @@ The grounding requirement is what keeps this from being unusable. By requiring e
 ### AI tools used
 
 - **Google Gemini 1.5 Flash** — all LLM work: fact extraction per chunk and pairwise relationship classification
-- **Kiro AI (Claude)** — pair programming throughout: architecture design, pipeline scaffolding, debugging OOM crashes, TypeScript type fixes, and documentation
 
 ---
-
-## Interviewer Guide — quick verification
-
-Follow these steps to run the project, reproduce the four required cases, and inspect the console logs that show how extraction, grounding, and comparison work.
-
-1. Install & env
-
-```bash
-npm install
-# create .env.local as documented above (MONGODB_URI, NEXTAUTH_SECRET, NEXT_PUBLIC_APP_URL)
-```
-
-2. Seed demo cases (optional but recommended)
-
-```bash
-node scripts/seed-demo.js
-```
-
-3. Start dev server (normal)
-
-```bash
-npm run dev
-```
-
-If you need a larger Node heap for large PDFs (temporary):
-
-```bash
-npm run dev:heap
-```
-
-4. Open the app
-
-Visit `http://localhost:3000`, register/login, and go to the **Four Cases** tab. The seeded demo contains one example for each required case.
-
-5. Upload a PDF to test the pipeline
-
-- Use the Upload area. The server console (where you ran `npm run dev`) will print detailed logs for each step:
-      - `[upload] parseMultipartFiles: called` — multer bridge received the request
-      - `[upload] multer parsed N file(s)` — temp files created in `/tmp`
-      - `[api/upload] reading file from disk:` — file read length
-      - `[parse] parsePdf: starting pdf-parse` and per-page logs — page lengths
-      - `[llm/extract] Extracting facts from doc=..., page=..., chunk_len=...` — LLM calls
-      - `[llm/extract] Parsed fact: ...` — each parsed fact that passed grounding
-      - `[docId] Creating fact: ...` — DB writes for facts
-      - `[llm/compare] Comparing facts: ...` and `[llm/compare] Gemini response text` — comparison calls and results
-      - `[docId] Creating relationship between ...` — relationship writes
-
-6. Verify the four cases
-
-- **Corroboration / Contradiction / Reconciled** — open the **Relationships** tab or **Four Cases** panel to see relationships and explanations selected by confidence.
-- **Extraction failure** — check the console logs for warnings like `Discarding ungrounded quote:`; the UI will not show discarded facts.
-
-7. Troubleshooting
-
-- If the server crashes with OOM on very large PDFs, use `npm run dev:heap` or process files smaller or offset into a worker queue (recommended future step).
-- If Next.js build fails due to a runtime error, check the server console for the stack trace and the log prefixes above — I added detailed logs to `lib/upload/multer.ts`, `app/api/upload/route.ts`, `lib/pipeline/parse.ts`, `lib/pipeline/ingest.ts`, `lib/llm/extract.ts`, and `lib/llm/compare.ts` to aid debugging.
-
-8. What to include in your demo video
-
-- Show `npm run dev` console output while uploading a PDF.
-- Show the **Four Cases** tab demonstrating corroboration, contradiction, and reconciliation with source quotes.
-- Point out one extraction failure and explain how the grounding check caught it and how you'd fix it (table-aware extraction).
-
-If you'd like, I can also scaffold an async job queue (BullMQ + Redis) so uploads return immediately and processing runs in background — this is the next production-grade improvement.
